@@ -1,6 +1,196 @@
-PATCH: sched/fair.c (illustrative)
-- Adds tek_interactivity_score()
-- Scales vruntime growth for interactive tasks using bias_alpha
-- Tie-breaks pick_next_entity with bias_beta
-- Exposes /proc/sys/sched_tek/* via sysctl
-(See full version you can adapt to your kernel tree.)
+From 3b1f8f1e5c1a2a00000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Geunsik Lim <leemgs@gmail.com>
+Date: Sat, 27 Sep 2025 14:30:00 +0900
+Subject: [PATCH] sched/fair: Add SCHED_TEK bounded responsiveness bias and
+ tie-breaker with sysctl knobs
+
+This patch introduces SCHED_TEK, an illustrative extension to the CFS path
+that applies a bounded responsiveness bias for interactive tasks and a simple
+tie-breaker that prefers recently woken interactive tasks under contention.
+Tuning knobs are exposed under /proc/sys/sched_tek/*.
+
+Notes:
+- This patch is **illustrative** for the artifact; line numbers/structures
+  may differ in your kernel tree and may need adaptation.
+- The bias is intentionally simple and cheap; it scales vruntime growth
+  using a per-entity "interactivity score" proxy based on sleep/run history.
+- A tie-breaker offsets vruntime by beta * interactivity for the final pick.
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -100,6 +100,46 @@
+ static u64 calc_delta_fair(u64 delta, struct sched_entity *se);
+
++/*
++ * === SCHED_TEK: Bounded responsiveness bias ===
++ *
++ * The goal is to slightly favor interactive tasks (i.e., ones that sleep and
++ * wake frequently) without destroying long-term fairness. We compute a coarse
++ * interactivity proxy and reduce the vruntime growth rate accordingly:
++ *
++ *    vruntime += base_delta - base_delta * (alpha * interactivity) / 10_000
++ *
++ * where alpha and interactivity are 0..100 integers.
++ * We also apply a tie-break preference during pick_next_entity():
++ *
++ *    score(se) = se->vruntime - beta * interactivity(se)
++ *
++ * Knobs are exposed via /proc/sys/sched_tek/{bias_alpha,bias_beta,bias_mode}.
++ */
++
++/* Percent-like knobs (0..100). */
++unsigned int sched_tek_bias_alpha __read_mostly = 20; /* responsiveness scalar */
++unsigned int sched_tek_bias_beta  __read_mostly = 15; /* tie-break scalar */
++
++enum sched_tek_mode {
++	TEK_STATIC = 0,
++	TEK_ADAPTIVE = 1,
++	TEK_HYBRID = 2,
++};
++
++unsigned int sched_tek_mode __read_mostly = TEK_HYBRID;
++
++static inline u32 tek_clamp_pct(int v)
++{
++	if (v < 0)   return 0;
++	if (v > 100) return 100;
++	return (u32)v;
++}
++
++static inline u32 tek_interactivity_score(const struct sched_entity *se)
++{
++	/* Very cheap proxy using existing stats; customize as you wish. */
++	u64 sl = se->statistics.sleep_max;  /* coarse "how sleepy" signal */
++	u64 rn = se->statistics.nr_migrations + 1; /* avoid div-by-zero */
++	u64 s  = (sl > rn) ? (sl / rn) : 0; /* 0..(unbounded), we clamp */
++	return tek_clamp_pct((int)(s > 100 ? 100 : s));
++}
++
+ /* -------------------------------------------------------------- */
+ /* CFS core                                                       */
+ /* -------------------------------------------------------------- */
+@@ -6137,7 +6177,31 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 	u64 now = rq_clock_task(rq_of(cfs_rq));
+ 	u64 delta_exec;
+
+ 	delta_exec = now - curr->exec_start;
+ 	if (unlikely((s64)delta_exec <= 0))
+ 		return;
+
+ 	curr->exec_start = now;
+ 	curr->sum_exec_runtime += delta_exec;
+-	curr->vruntime += calc_delta_fair(delta_exec, curr);
++
++	/*
++	 * SCHED_TEK:
++	 * Apply bounded responsiveness bias by scaling vruntime growth for
++	 * interactive tasks. This is deliberately conservative and only
++	 * touches the local entity on-rq.
++	 */
++	u64 base = calc_delta_fair(delta_exec, curr);
++
++	if (likely(curr->on_rq)) {
++		u32 ia = tek_interactivity_score(curr);      /* 0..100 */
++		u32 a  = tek_clamp_pct((int)sched_tek_bias_alpha); /* 0..100 */
++
++		/* adj = base * (1 - (a*ia)/10_000) */
++		u64 adj = base;
++		if (ia && a) {
++			u64 red = (base * (u64)a * (u64)ia) / 10000ULL;
++			if (red < base)
++				adj = base - red;
++		}
++		curr->vruntime += adj;
++	} else {
++		curr->vruntime += base;
++	}
+ 
+ 	update_min_vruntime(cfs_rq);
+ }
+@@ -8021,7 +8085,29 @@ static struct sched_entity *pick_next_entity(struct cfs_rq *cfs_rq)
+ {
+-	return __pick_first_entity(cfs_rq);
++	/*
++	 * SCHED_TEK:
++	 * Preserve the winner from red-black tree, then peek the immediate
++	 * next entity and perform a simple tie-break preference based on
++	 * interactivity. This keeps changes minimal while making preference
++	 * under tight contention more responsive.
++	 */
++	struct sched_entity *best = __pick_first_entity(cfs_rq);
++	struct sched_entity *cand = __pick_next_entity(cfs_rq, best);
++
++	if (!cand)
++		return best;
++
++	u32 b = tek_clamp_pct((int)sched_tek_bias_beta);
++	if (!b)
++		return best;
++
++	s64 best_score = (s64)best->vruntime - (s64)(b * tek_interactivity_score(best));
++	s64 cand_score = (s64)cand->vruntime - (s64)(b * tek_interactivity_score(cand));
++
++	if (cand_score < best_score)
++		return cand;
++	return best;
+ }
+ 
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -2500,6 +2500,51 @@
+ extern unsigned int sysctl_sched_migration_cost;
+ 
++/* SCHED_TEK sysctls */
++extern unsigned int sched_tek_bias_alpha;
++extern unsigned int sched_tek_bias_beta;
++extern unsigned int sched_tek_mode;
++
++static struct ctl_table sched_tek_table[] = {
++	{
++		.procname	= "bias_alpha",
++		.data		= &sched_tek_bias_alpha,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &(int){ 0 },
++		.extra2		= &(int){ 100 },
++	},
++	{
++		.procname	= "bias_beta",
++		.data		= &sched_tek_bias_beta,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &(int){ 0 },
++		.extra2		= &(int){ 100 },
++	},
++	{
++		.procname	= "bias_mode",
++		.data		= &sched_tek_mode,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &(int){ 0 }, /* TEK_STATIC */
++		.extra2		= &(int){ 2 }, /* ..TEK_HYBRID */
++	},
++	{ }
++};
++
+ static struct ctl_table kern_table[] = {
+ 	{
+ 		.procname	= "sched_domain",
+ 		.mode		= 0555,
+ 		.child		= sched_domain_table,
+ 	},
++	/* SCHED_TEK entry */
++	{
++		.procname	= "sched_tek",
++		.mode		= 0555,
++		.child		= sched_tek_table,
++	},
+ 	{ }
+ };
+ 
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2250,6 +2250,13 @@ struct sch
