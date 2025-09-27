@@ -1,0 +1,6 @@
+PATCH: sched/fair.c (illustrative)
+- Adds tek_interactivity_score()
+- Scales vruntime growth for interactive tasks using bias_alpha
+- Tie-breaks pick_next_entity with bias_beta
+- Exposes /proc/sys/sched_tek/* via sysctl
+(See full version you can adapt to your kernel tree.)
