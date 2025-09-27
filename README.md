@@ -33,3 +33,23 @@ python3 ../scripts/analyze_results.py --input ../results --out ../results
 ```
 
 > Notes: The patch is crafted for readability and may require small massaging for specific kernel trees/configs. Use bare metal for stable numbers.
+
+
+## (Optional) Per-cgroup knobs (illustrative)
+If you wire the provided cgroup v2 stubs into your cpu controller, you'll get files like:
+```
+/sys/fs/cgroup/<grp>/cpu.sched_tek.alpha_base
+/sys/fs/cgroup/<grp>/cpu.sched_tek.beta
+/sys/fs/cgroup/<grp>/cpu.sched_tek.mode
+...
+```
+Example:
+```bash
+# Create group and move a PID
+sudo systemd-run --scope -p MemoryMax=2G -p CPUWeight=100 --unit=latency.slice sleep infinity &
+PID=$!
+CG=/sys/fs/cgroup/system.slice/latency.slice
+echo 30 | sudo tee $CG/cpu.sched_tek.alpha_base
+echo 2  | sudo tee $CG/cpu.sched_tek.mode     # ADAPTIVE
+```
+*Note:* The artifact includes **stubs**; production kernels must properly register these files within the cpu controller and maintain per-task_group `tek_tunables` with correct locking/lifetime.

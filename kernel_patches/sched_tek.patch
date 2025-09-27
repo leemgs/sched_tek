@@ -1,104 +1,187 @@
-From 3b1f8f1e5c1a2a00000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Geunsik Lim <leemgs@gmail.com>
-Date: Sat, 27 Sep 2025 14:30:00 +0900
-Subject: [PATCH] sched/fair: Add SCHED_TEK bounded responsiveness bias and
- tie-breaker with sysctl knobs
+From 9c2b7aa0e5e7d800000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SCHED_TEK Authors <sched_tek@example.com>
+Date: Sat, 27 Sep 2025 15:05:00 +0900
+Subject: [PATCH] sched/fair: SCHED_TEK v2 — adaptive/hybrid feedback, PELT
+ coupling, per-cgroup tunables (illustrative)
 
-This patch introduces SCHED_TEK, an illustrative extension to the CFS path
-that applies a bounded responsiveness bias for interactive tasks and a simple
-tie-breaker that prefers recently woken interactive tasks under contention.
-Tuning knobs are exposed under /proc/sys/sched_tek/*.
+This patch refines SCHED_TEK with:
+- ADAPTIVE / HYBRID feedback loop that adjusts alpha (bias) from fairness
+  telemetry (EWMA of wait-variance proxy) and PELT (runnable_avg/load_avg).
+- Per-cgroup tunables (task_group-level) with inheritance and sysctl defaults.
+- Cleaner helpers and comments for artifact readability.
 
-Notes:
-- This patch is **illustrative** for the artifact; line numbers/structures
-  may differ in your kernel tree and may need adaptation.
-- The bias is intentionally simple and cheap; it scales vruntime growth
-  using a per-entity "interactivity score" proxy based on sleep/run history.
-- A tie-breaker offsets vruntime by beta * interactivity for the final pick.
+DISCLAIMER
+----------
+This is an *illustrative* artifact patch. Linux scheduler internals change
+frequently; line numbers/symbols may differ. For production use, port the
+helpers (tek_*()) and per-cgroup plumbing to your kernel tree and test
+extensively.
 
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -100,6 +100,46 @@
+@@ -90,11 +90,77 @@
+ #include <linux/sched/sysctl.h>
+ #include <linux/sched/deadline.h>
+ 
  static u64 calc_delta_fair(u64 delta, struct sched_entity *se);
-
-+/*
-+ * === SCHED_TEK: Bounded responsiveness bias ===
+ 
++/* =========================  SCHED_TEK v2  =============================
++ * Goals:
++ *  - Small, bounded responsiveness bias for interactive tasks.
++ *  - Feedback loop: reduce bias when fairness signals degrade.
++ *  - Couple to PELT to avoid biasing when runnable pressure is high.
++ *  - Allow per-cgroup overrides with sane sysctl defaults (inheritance).
 + *
-+ * The goal is to slightly favor interactive tasks (i.e., ones that sleep and
-+ * wake frequently) without destroying long-term fairness. We compute a coarse
-+ * interactivity proxy and reduce the vruntime growth rate accordingly:
-+ *
-+ *    vruntime += base_delta - base_delta * (alpha * interactivity) / 10_000
-+ *
-+ * where alpha and interactivity are 0..100 integers.
-+ * We also apply a tie-break preference during pick_next_entity():
-+ *
-+ *    score(se) = se->vruntime - beta * interactivity(se)
-+ *
-+ * Knobs are exposed via /proc/sys/sched_tek/{bias_alpha,bias_beta,bias_mode}.
++ * Key signals (cheap proxies):
++ *   - interactivity(se): clamp_0_100(f(se->statistics.sleep_max, nr_migrations))
++ *   - fairness(cfs_rq):  EWMA of wait-variance proxy & vruntime-spread proxy
++ *   - PELT(cfs_rq):      cfs_rq->avg.runnable_avg/load_avg
 + */
 +
-+/* Percent-like knobs (0..100). */
-+unsigned int sched_tek_bias_alpha __read_mostly = 20; /* responsiveness scalar */
-+unsigned int sched_tek_bias_beta  __read_mostly = 15; /* tie-break scalar */
-+
-+enum sched_tek_mode {
-+	TEK_STATIC = 0,
-+	TEK_ADAPTIVE = 1,
-+	TEK_HYBRID = 2,
++/* Tunables (global defaults; per-cgroup may override) */
++struct tek_tunables {
++	unsigned int alpha_base;   /* 0..100 */
++	unsigned int beta;         /* 0..100 */
++	unsigned int mode;         /* 0=STATIC,1=ADAPTIVE,2=HYBRID */
++	unsigned int alpha_min;    /* floor for effective alpha */
++	unsigned int alpha_max;    /* cap   for effective alpha */
++	unsigned int fairness_target; /* 0..100 (lower=looser target) */
++	unsigned int step_up;      /* alpha increment when healthy */
++	unsigned int step_down;    /* alpha decrement when unfair */
++	unsigned int pelt_guard;   /* 0..100 scale to damp under high runnable */
++	unsigned int ewma_tau_ms;  /* EWMA time constant for fairness (approx) */
 +};
 +
-+unsigned int sched_tek_mode __read_mostly = TEK_HYBRID;
++/* Per-runqueue telemetry */
++struct tek_stats {
++	u64 last_update_ns;
++	u64 wait_var_ewma;     /* arbitrary scaled */
++	u64 vruntime_spread;   /* rolling spread proxy */
++	unsigned int alpha_dyn;/* dynamic alpha computed by feedback loop */
++};
 +
-+static inline u32 tek_clamp_pct(int v)
-+{
-+	if (v < 0)   return 0;
-+	if (v > 100) return 100;
-+	return (u32)v;
-+}
++/* Global defaults (sysctls wire these) */
++static struct tek_tunables tek_sys = {
++	.alpha_base     = 20,
++	.beta           = 15,
++	.mode           = 2,    /* HYBRID */
++	.alpha_min      =  5,
++	.alpha_max      = 40,
++	.fairness_target= 50,
++	.step_up        = 1,
++	.step_down      = 2,
++	.pelt_guard     = 30,
++	.ewma_tau_ms    = 200,
++};
++
++/* Light-weight helpers */
++static inline u32 tek_clamp_pct(int v) { return v<0?0:(v>100?100:(u32)v); }
 +
 +static inline u32 tek_interactivity_score(const struct sched_entity *se)
 +{
-+	/* Very cheap proxy using existing stats; customize as you wish. */
-+	u64 sl = se->statistics.sleep_max;  /* coarse "how sleepy" signal */
-+	u64 rn = se->statistics.nr_migrations + 1; /* avoid div-by-zero */
-+	u64 s  = (sl > rn) ? (sl / rn) : 0; /* 0..(unbounded), we clamp */
++	u64 sl = se->statistics.sleep_max;
++	u64 rn = se->statistics.nr_migrations + 1;
++	u64 s  = (sl > rn) ? (sl / rn) : 0;
 +	return tek_clamp_pct((int)(s > 100 ? 100 : s));
++}
++
++/* Read PELT signals (runnable/load) as 0..100 guards */
++static inline u32 tek_pelt_pressure(const struct cfs_rq *cfs_rq)
++{
++	u64 run = cfs_rq->avg.runnable_avg;  /* units depend on kernel */
++	u64 load= cfs_rq->avg.load_avg;
++	u64 p   = run + load;
++	if (p == 0) return 0;
++	/* map to 0..100 with a simple saturating scale */
++	if (p > 1024) return 100;
++	return (u32)((p * 100) / 1024);
++}
++
++static inline void tek_stats_init(struct tek_stats *ts, u64 now_ns)
++{
++	memset(ts, 0, sizeof(*ts));
++	ts->last_update_ns = now_ns;
++	ts->alpha_dyn = tek_sys.alpha_base;
 +}
 +
  /* -------------------------------------------------------------- */
  /* CFS core                                                       */
  /* -------------------------------------------------------------- */
-@@ -6137,7 +6177,31 @@ static void update_curr(struct cfs_rq *cfs_rq)
+@@ -6100,6 +6166,28 @@ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ 	/* ... unchanged ... */
+ }
+ 
++/* --- SCHED_TEK fairness feedback (cheap proxies) -------------------- */
++static void tek_feedback_update(struct cfs_rq *cfs_rq, u64 now_ns)
++{
++	struct tek_stats *ts = (struct tek_stats *)cfs_rq->tek_priv; /* opaque slot */
++	if (!ts) return;
++
++	u64 dt = now_ns - ts->last_update_ns;
++	if ((s64)dt <= 0) return;
++	ts->last_update_ns = now_ns;
++
++	/* Proxy for wait variance: compare min_vruntime vs. a sampled entity. */
++	u64 spread = (u64)(cfs_rq->min_vruntime - cfs_rq->avg_vruntime);
++	ts->vruntime_spread = (spread > ts->vruntime_spread) ? spread : (ts->vruntime_spread * 15 / 16);
++
++	/* Cheap EWMA update (no real-time units here; illustrative). */
++	ts->wait_var_ewma = (ts->wait_var_ewma * 7 + ts->vruntime_spread) / 8;
++
++	/* ADAPTIVE controller: push alpha_dyn up/down around fairness_target. */
++	if (tek_sys.mode != 0) {
++		bool unfair = (ts->wait_var_ewma > tek_sys.fairness_target);
++		int a = ts->alpha_dyn + (unfair ? -(int)tek_sys.step_down : (int)tek_sys.step_up);
++		if (a < (int)tek_sys.alpha_min) a = tek_sys.alpha_min;
++		if (a > (int)tek_sys.alpha_max) a = tek_sys.alpha_max;
++		ts->alpha_dyn = a;
++	}
++}
++
+@@ -6137,7 +6225,49 @@ static void update_curr(struct cfs_rq *cfs_rq)
  	u64 now = rq_clock_task(rq_of(cfs_rq));
  	u64 delta_exec;
-
+ 
  	delta_exec = now - curr->exec_start;
  	if (unlikely((s64)delta_exec <= 0))
  		return;
-
+ 
  	curr->exec_start = now;
  	curr->sum_exec_runtime += delta_exec;
 -	curr->vruntime += calc_delta_fair(delta_exec, curr);
 +
-+	/*
-+	 * SCHED_TEK:
-+	 * Apply bounded responsiveness bias by scaling vruntime growth for
-+	 * interactive tasks. This is deliberately conservative and only
-+	 * touches the local entity on-rq.
-+	 */
++	/* SCHED_TEK: update fairness feedback first */
++	tek_feedback_update(cfs_rq, now);
++
++	/* Base CFS delta */
 +	u64 base = calc_delta_fair(delta_exec, curr);
 +
-+	if (likely(curr->on_rq)) {
-+		u32 ia = tek_interactivity_score(curr);      /* 0..100 */
-+		u32 a  = tek_clamp_pct((int)sched_tek_bias_alpha); /* 0..100 */
++	/* Compute effective alpha:
++	 *  STATIC:   alpha_eff = alpha_base
++	 *  ADAPTIVE: alpha_eff = ts->alpha_dyn
++	 *  HYBRID:   alpha_eff = clamp(alpha_base + ts->alpha_dyn/2)
++	 *  Guarded by PELT pressure to avoid excess bias when system is hot.
++	 */
++	struct tek_stats *ts = (struct tek_stats *)cfs_rq->tek_priv;
++	u32 alpha_eff = tek_sys.alpha_base;
++	if (ts) {
++		if (tek_sys.mode == 1)       alpha_eff = ts->alpha_dyn;
++		else if (tek_sys.mode == 2)  alpha_eff = tek_clamp_pct((int)tek_sys.alpha_base + (int)ts->alpha_dyn/2);
++	}
 +
-+		/* adj = base * (1 - (a*ia)/10_000) */
++	u32 pelt = tek_pelt_pressure(cfs_rq);
++	if (pelt > tek_sys.pelt_guard) {
++		/* damp alpha under heavy runnable pressure */
++		alpha_eff = alpha_eff * (100 - (pelt - tek_sys.pelt_guard)) / 100;
++	}
++
++	/* Apply bounded bias */
++	if (likely(curr->on_rq)) {
++		u32 ia = tek_interactivity_score(curr); /* 0..100 */
 +		u64 adj = base;
-+		if (ia && a) {
-+			u64 red = (base * (u64)a * (u64)ia) / 10000ULL;
-+			if (red < base)
-+				adj = base - red;
++		if (ia && alpha_eff) {
++			u64 red = (base * (u64)alpha_eff * (u64)ia) / 10000ULL;
++			if (red < base) adj = base - red;
 +		}
 +		curr->vruntime += adj;
 +	} else {
@@ -107,72 +190,99 @@ Notes:
  
  	update_min_vruntime(cfs_rq);
  }
-@@ -8021,7 +8085,29 @@ static struct sched_entity *pick_next_entity(struct cfs_rq *cfs_rq)
+@@ -8021,7 +8149,31 @@ static struct sched_entity *pick_next_entity(struct cfs_rq *cfs_rq)
  {
 -	return __pick_first_entity(cfs_rq);
-+	/*
-+	 * SCHED_TEK:
-+	 * Preserve the winner from red-black tree, then peek the immediate
-+	 * next entity and perform a simple tie-break preference based on
-+	 * interactivity. This keeps changes minimal while making preference
-+	 * under tight contention more responsive.
-+	 */
++	/* SCHED_TEK: tie-breaker favoring interactive */
 +	struct sched_entity *best = __pick_first_entity(cfs_rq);
 +	struct sched_entity *cand = __pick_next_entity(cfs_rq, best);
++	if (!cand) return best;
 +
-+	if (!cand)
-+		return best;
-+
-+	u32 b = tek_clamp_pct((int)sched_tek_bias_beta);
-+	if (!b)
-+		return best;
++	u32 b = tek_clamp_pct((int)tek_sys.beta);
++	if (!b) return best;
 +
 +	s64 best_score = (s64)best->vruntime - (s64)(b * tek_interactivity_score(best));
 +	s64 cand_score = (s64)cand->vruntime - (s64)(b * tek_interactivity_score(cand));
++	return (cand_score < best_score) ? cand : best;
+ }
+ 
++/* --- SCHED_TEK: minimal init hook for cfs_rq private stats ------------- */
++static void tek_attach_cfs_rq(struct cfs_rq *cfs_rq)
++{
++	if (!cfs_rq->tek_priv) {
++		cfs_rq->tek_priv = kzalloc(sizeof(struct tek_stats), GFP_KERNEL);
++		if (cfs_rq->tek_priv)
++			tek_stats_init((struct tek_stats *)cfs_rq->tek_priv, ktime_get_ns());
++	}
++}
 +
-+	if (cand_score < best_score)
-+		return cand;
-+	return best;
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1230,6 +1230,10 @@ void __init sched_init(void)
+ 	/* ... existing ... */
++	/* SCHED_TEK: ensure cfs_rq have private storage */
++	for_each_possible_cpu(i) {
++		tek_attach_cfs_rq(&cpu_rq(i)->cfs);
++	}
  }
  
 --- a/kernel/sysctl.c
 +++ b/kernel/sysctl.c
-@@ -2500,6 +2500,51 @@
+@@ -2500,6 +2500,81 @@
  extern unsigned int sysctl_sched_migration_cost;
  
-+/* SCHED_TEK sysctls */
-+extern unsigned int sched_tek_bias_alpha;
-+extern unsigned int sched_tek_bias_beta;
-+extern unsigned int sched_tek_mode;
++/* ----------------- SCHED_TEK sysctls (global defaults) ---------------- */
++static int sysctl_tek_alpha_base;
++static int sysctl_tek_beta;
++static int sysctl_tek_mode;
++static int sysctl_tek_alpha_min;
++static int sysctl_tek_alpha_max;
++static int sysctl_tek_fairness_target;
++static int sysctl_tek_step_up;
++static int sysctl_tek_step_down;
++static int sysctl_tek_pelt_guard;
++static int sysctl_tek_ewma_tau_ms;
++
++static int proc_tek_sync(struct ctl_table *table, int write,
++			 void __user *buffer, size_t *lenp, loff_t *ppos)
++{
++	int ret = proc_dointvec(table, write, buffer, lenp, ppos);
++	if (ret) return ret;
++	/* copy shadow -> live */
++	tek_sys.alpha_base      = tek_clamp_pct(sysctl_tek_alpha_base);
++	tek_sys.beta            = tek_clamp_pct(sysctl_tek_beta);
++	tek_sys.mode            = tek_clamp_pct(sysctl_tek_mode) % 3;
++	tek_sys.alpha_min       = tek_clamp_pct(sysctl_tek_alpha_min);
++	tek_sys.alpha_max       = tek_clamp_pct(sysctl_tek_alpha_max);
++	tek_sys.fairness_target = tek_clamp_pct(sysctl_tek_fairness_target);
++	tek_sys.step_up         = tek_clamp_pct(sysctl_tek_step_up);
++	tek_sys.step_down       = tek_clamp_pct(sysctl_tek_step_down);
++	tek_sys.pelt_guard      = tek_clamp_pct(sysctl_tek_pelt_guard);
++	tek_sys.ewma_tau_ms     = max(1, sysctl_tek_ewma_tau_ms);
++	return 0;
++}
 +
 +static struct ctl_table sched_tek_table[] = {
-+	{
-+		.procname	= "bias_alpha",
-+		.data		= &sched_tek_bias_alpha,
-+		.maxlen		= sizeof(unsigned int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= &(int){ 0 },
-+		.extra2		= &(int){ 100 },
-+	},
-+	{
-+		.procname	= "bias_beta",
-+		.data		= &sched_tek_bias_beta,
-+		.maxlen		= sizeof(unsigned int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= &(int){ 0 },
-+		.extra2		= &(int){ 100 },
-+	},
-+	{
-+		.procname	= "bias_mode",
-+		.data		= &sched_tek_mode,
-+		.maxlen		= sizeof(unsigned int),
-+		.mode		= 0644,
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= &(int){ 0 }, /* TEK_STATIC */
-+		.extra2		= &(int){ 2 }, /* ..TEK_HYBRID */
-+	},
++	{ .procname="alpha_base", .data=&sysctl_tek_alpha_base, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="beta", .data=&sysctl_tek_beta, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="mode", .data=&sysctl_tek_mode, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="alpha_min", .data=&sysctl_tek_alpha_min, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="alpha_max", .data=&sysctl_tek_alpha_max, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="fairness_target", .data=&sysctl_tek_fairness_target, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="step_up", .data=&sysctl_tek_step_up, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="step_down", .data=&sysctl_tek_step_down, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="pelt_guard", .data=&sysctl_tek_pelt_guard, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
++	{ .procname="ewma_tau_ms", .data=&sysctl_tek_ewma_tau_ms, .maxlen=sizeof(int),
++	  .mode=0644, .proc_handler=proc_tek_sync },
 +	{ }
 +};
 +
@@ -182,7 +292,6 @@ Notes:
  		.mode		= 0555,
  		.child		= sched_domain_table,
  	},
-+	/* SCHED_TEK entry */
 +	{
 +		.procname	= "sched_tek",
 +		.mode		= 0555,
@@ -191,6 +300,124 @@ Notes:
  	{ }
  };
  
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -450,6 +450,13 @@ struct cfs_rq {
+ 	u64			min_vruntime;
+ 	struct rb_root_cached	tasks_timeline;
+ 	struct rb_node		*rb_leftmost;
++
++	/* SCHED_TEK private slot for telemetry (allocated in tek_attach_cfs_rq) */
++	void			*tek_priv;
++
++	/* Optional: rolling average of vruntime to avoid scanning the tree.
++	 * For illustration we treat it as maintained elsewhere.
++	 u64			avg_vruntime; */
+ };
+ 
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -2250,6 +2250,13 @@ struct sch
+@@ -2250,6 +2250,28 @@ struct sched_statistics {
+ 	u64		nr_periods;
+ 	u64		nr_throttled;
+ 	u64		throttled_time;
++
++	/*
++	 * SCHED_TEK:
++	 * We reuse existing fields for cheap proxies. No additional stats
++	 * are strictly required by the artifact patch.
++	 */
+ };
+ 
+ /* ... rest of file ... */
+ 
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -9000,6 +9070,80 @@ static void attach_task_cfs_rq(struct task_struct *p)
+ 	/* ... existing ... */
+ }
+ 
++/* ==================== Per-cgroup tunables (illustrative) ==================
++ * For a production-grade integration, create cpu controller files:
++ *   /sys/fs/cgroup/<grp>/cpu.sched_tek.{alpha_base,beta,mode,...}
++ * and plumb them into task_group (struct task_group) so that cfs_rq for the
++ * group inherits overrides. Here we show a minimal sketch:
++ */
++
++struct tek_tunables *task_group_tek_tunables(struct task_group *tg);
++
++static inline const struct tek_tunables *tek_get_tunables(struct cfs_rq *cfs_rq)
++{
++	/* If cgroup override exists, return it; else global sysctl defaults */
++	struct task_group *tg = cfs_rq->tg;
++	struct tek_tunables *t = task_group_tek_tunables(tg);
++	return t ? t : &tek_sys;
++}
++
++/* Example usage swap-in (replace tek_sys.* reads above with tek_get_tunables()) */
++/* For brevity in the artifact we keep tek_sys direct reads in hot paths and
++ * only annotate here how to wire per-cgroup reads. */
++
++/* Stub: in a real patch, implement task_group_tek_tunables(), allocate/free
++ * per-tg tunables on cgroup creation/destruction, and expose cgroup files. */
++
+ /* ==================== End of SCHED_TEK v2 additions ===================== */
+ 
+-- 
+2.44.0
+
+
+--- a/kernel/sched/cpuacct.c
++++ b/kernel/sched/cpuacct.c
+@@ -10,6 +10,63 @@
+  * NOTE: This file is used here only as an anchor point to illustrate how
+  *       cgroup files could be wired. In a real kernel, integrate into
+  *       cpu controller (e.g., kernel/sched/cpu.c or kernel/sched/fair.c).
++ *
++ * === SCHED_TEK per-cgroup tunables (illustrative) =====================
++ * Expose files (cgroup v2):
++ *   cpu.sched_tek.alpha_base
++ *   cpu.sched_tek.beta
++ *   cpu.sched_tek.mode
++ *   cpu.sched_tek.alpha_min
++ *   cpu.sched_tek.alpha_max
++ *   cpu.sched_tek.fairness_target
++ *   cpu.sched_tek.step_up
++ *   cpu.sched_tek.step_down
++ *   cpu.sched_tek.pelt_guard
++ *   cpu.sched_tek.ewma_tau_ms
++ *
++ * This stub shows the kobj/ops shape; production code should integrate
++ * with the cpu controller proper and ensure locking/lifetime are correct.
++ */
++
++struct tek_tunables;
++struct tek_tunables *task_group_tek_tunables(struct task_group *tg);
++
++static ssize_t tek_cgv2_show(struct kernfs_open_file *of, char *buf, size_t buflen,
++			     unsigned int (*getter)(const struct tek_tunables *tt))
++{
++	struct cgroup_subsys_state *css = of->kn->parent->priv; /* illustrative */
++	struct task_group *tg = css_tg(css);
++	const struct tek_tunables *tt = task_group_tek_tunables(tg);
++	if (!tt) return scnprintf(buf, buflen, "inherit\n");
++	return scnprintf(buf, buflen, "%u\n", getter(tt));
++}
++
++static ssize_t tek_cgv2_write(struct kernfs_open_file *of, char *buf, size_t nbytes,
++			      void (*setter)(struct tek_tunables *tt, unsigned int v))
++{
++	unsigned long v;
++	if (kstrtoul(buf, 10, &v)) return -EINVAL;
++	struct cgroup_subsys_state *css = of->kn->parent->priv; /* illustrative */
++	struct task_group *tg = css_tg(css);
++	struct tek_tunables *tt = task_group_tek_tunables(tg);
++	if (!tt) return -EOPNOTSUPP;
++	setter(tt, (unsigned int)v);
++	return nbytes;
++}
++
++/* File ops would be declared per field; omitted for brevity in artifact. */
++/* Register these files when the cpu controller initializes cgroup dirs. */
++
++/* ===================================================================== */
