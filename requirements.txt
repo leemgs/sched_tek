@@ -1,1 +1,4 @@
-# stdlib only
+matplotlib>=3.7
+pandas>=2.2
+numpy>=1.26
+scipy>=1.11

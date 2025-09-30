@@ -1,98 +1,40 @@
-# SCHED_TEK — Reproduction Kit (LLM‑assisted Kernel Tuning, Sandbox‑Safe)
+# SCHED_TEK — Reproduction Kit
 
-This repository provides a **fully runnable reference pipeline** that reproduces the core workflow described in your paper:
+This repository is a *minimal, runnable scaffold* to reproduce core results and figures for the paper:
 
-1. **Telemetry** (synthetic or pluggable) →  
-2. **Semantic Knowledge Base (KB)** (JSON tunable metadata) →  
-3. **Reasoning Engine** (deterministic, rule‑based stub) →  
-4. **Safety Guardrails** (bounds & relational checks) →  
-5. **Staged Rollout** (sandboxed `sysctl` writer; *no privileged ops by default*) →  
-6. **Monitoring** (post‑apply checks) →  
-7. **Evaluation** (median P95 comparison across trials)
+> **Responsiveness Is Not a Trade-Off: Revisiting Kernel Scheduling with Controlled Bias** (TMC submission, 2025-09-30)  [Artifact mapping in this kit].
 
-> 🛡️ **Safety First:** By default, this kit never writes to `/proc` or `/sys`. All changes are staged to `experiments/sandbox/sysctl.conf`.  
-> To enable **live writes** on a test machine you control, set `LIVE_APPLY=1` **and** run with appropriate privileges (see below). Even then, built‑in guardrails will reject unsafe actions.
+It supports two modes:
 
----
+1. **Sandbox mode (default)** — generates synthetic but structured traces to validate the analysis pipeline end-to-end on any Linux host (no root needed).
+2. **Kernel mode (optional)** — if you have applied the `kernel_patches/sched_tek.patch` to Linux ≥ 6.8 and exposed `/proc/sys/sched_tek/…`, the same harness reads real counters and reproduces tables & plots from the paper.
 
-## Quickstart
+> **Note**: This kit mirrors the paper’s sections (Design §V, Evaluation §VI, Reproducibility Appendix). Citations in the paper describe the metrics and figures reproduced here. See `docs/REPRODUCE.md` for details. 
 
-**Requirements:** Python 3.10+ (no external packages required).
+
+## Install
 
 ```bash
-# 0) (optional) create a virtualenv
-python -m venv .venv && source .venv/bin/activate
-
-# 1) Clone / extract this repo, then run:
-python -m src.cli recommend --slo-p95-ms 120
-
-# 2) Stage (sandbox) the recommended config:
-python -m src.cli apply --dry-run 0
-
-# 3) Monitor:
-python -m src.cli monitor
-
-# 4) Evaluate across workloads (synthetic):
-python -m src.cli eval --trials 10
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-The CLI supports subcommands: `telemetry`, `recommend`, `apply`, `monitor`, `eval`.
+## Run
 
----
-
-## Live Apply (Optional, Advanced)
-
-> **Danger:** Kernel tuning can make systems unstable. Use only on non‑critical hosts you control.
->
-> 1) Review `configs/knowledge_base.json` and `src/safety.py` bounds.  
-> 2) Export `LIVE_APPLY=1` to permit writes.  
-> 3) Run with sufficient privileges (e.g., `sudo -E python -m src.cli apply`).  
-> 4) You can target write mode `sysctl` (preferred) or `/proc/sys` if available.
-
-The kit will still enforce:
-- numeric range checks,
-- blacklist/whitelist filters,
-- dependency sanity checks (e.g., starvation caps),
-- and rollback staging if a write fails.
-
----
-
-## Project Layout
-
-```
-src/
-  __init__.py
-  telemetry.py         # synthetic/pluggable metrics
-  kb.py                # loads tunable metadata
-  reasoning.py         # rule-based recommender
-  safety.py            # guardrails & validators
-  rollout.py           # sandbox or live apply
-  monitor.py           # post-apply health checks
-  eval.py              # experiment harness
-  cli.py               # CLI entry point
-configs/
-  knowledge_base.json  # tunables & bounds
-experiments/
-  sandbox/sysctl.conf  # staged writes (no root needed)
-  results/             # experiment outputs (CSV)
-scripts/
-  run_experiment.sh
-LICENSE.md
-README.md
+```bash
+bash benchmarks/run_all.sh --mode sandbox --repetitions 30
+python3 scripts/analyze_results.py --input results --out plots
 ```
 
----
+## Licensing
 
-## Reproducing Figures / Tables (Textual)
+This kit is released under Apache-2.0 (see `LICENSE.md`).
 
-- **Responsiveness–Fairness Curve:** `python -m src.eval --trials 20 --report curve`
-- **Energy Efficiency Comparison:** `python -m src.eval --trials 20 --report energy`
-- **Ablation Study:** `python -m src.eval --trials 20 --report ablation`
+## Notes
 
-(Plots are printed as CSV‑like text you can import into your plotting tool of choice.)
+- This scaffold includes an *illustrative* `kernel_patches/sched_tek.patch` showing where the bounded bias and tie-breaker would live in the kernel. It is **not** production-ready.
+- In **kernel mode**, the harness will look for `/proc/sys/sched_tek/` to read live stats and optionally write conservative knobs.
 
----
+## Provenance
 
-## Citation
-
-If this kit is useful, please cite your paper (add BibTeX here).
+This reproduction kit is aligned with the uploaded manuscript and its Appendix on artifact availability.

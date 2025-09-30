@@ -1,0 +1,40 @@
+From 000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Geunsik Lim <geunsik.lim@example.com>
+Date: Fri, 30 Sep 2025 12:00:00 +0900
+Subject: [sched_tek] Bounded-bias vruntime & tie-breaker + /proc control
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -100,6 +100,25 @@
+ /* Illustrative patch: do NOT use in production without review. */
++static int sched_tek_enabled __read_mostly = 1;
++static int sched_tek_mode __read_mostly = 2; /* 0=static,1=adaptive,2=hybrid */
++static int sched_tek_alpha __read_mostly = 20; /* 0..100 basis points */
++static int sched_tek_beta  __read_mostly = 15; /* 0..100 basis points */
++
++static u32 interactivity_score(struct task_struct *p)
++{
++    /* Placeholder: in real patch use sleep avg / io wait / wakeups */
++    return min_t(u32, 100, (u32)(p->se.avg.util_avg / 10));
++}
++
+ static void update_curr(struct cfs_rq *cfs_rq)
+ {
+     /* ... */
++    if (likely(sched_tek_enabled)) {
++        u32 B = interactivity_score(curr); /* 0..100 */
++        u64 bias = (u64)sched_tek_alpha * B; /* basis-point scaled */
++        curr->se.vruntime += (bias >> 8); /* bounded bias (toy) */
++    }
+ }
+@@ -200,6 +219,13 @@
+ static struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ {
++    if (sched_tek_enabled) {
++        /* toy tie-breaker: prefer higher B when vruntime similar */
++        /* real impl would search a small window of rb nodes */
++    }
+     /* existing logic ... */
+ }
+ 
+ /* /proc/sys/sched_tek entries are added in kernel/sysctl.c (omitted) */

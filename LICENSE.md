@@ -1,9 +1,11 @@
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
-...
+
 TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
 1. Definitions.
+
 "License" shall mean the terms and conditions for use, reproduction,
 and distribution as defined by Sections 1 through 9 of this document.
 ...
@@ -12,7 +14,7 @@ END OF TERMS AND CONDITIONS
 APPENDIX: How to apply the Apache License to your work.
 
    To apply the Apache License to your work, attach the following
-   boilerplate notice, with the fields enclosed by brackets "{}"
+   boilerplate notice, with the fields enclosed by brackets "[]"
    replaced with your own identifying information. (Don't include
    the brackets!)  The text should be enclosed in the appropriate
    comment syntax for the file format. We also recommend that a
@@ -20,7 +22,7 @@ APPENDIX: How to apply the Apache License to your work.
    same "printed page" as the copyright notice for easier
    identification within third-party archives.
 
-Copyright {2025} {Geunsik Lim}
+Copyright 2025 Geunsik Lim
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
