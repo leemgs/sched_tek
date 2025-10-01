@@ -1,0 +1,60 @@
+// File: kernel_patches/0007-sched-tek-Add-official-documentation.patch
+// This patch finalizes the SCHED_TEK series by adding official documentation 
+// for the new scheduler, explaining its principles and tunable parameters.
+
+// --- A. Documentation/scheduler/sched-tek.rst (New File Content) ---
+
+.. Documentation/scheduler/sched-tek.rst
+
+=======================================================
+SCHED_TEK: The Controlled Bias Scheduler
+=======================================================
+
+:Author: Anonymous Authors
+:Date: 2025-10-01
+
+SCHED_TEK challenges the conventional trade-off between scheduling responsiveness and fairness by introducing a **Controlled Bias** mechanism directly into the kernel's Completely Fair Scheduler (CFS) path. It uses dynamic feedback loops to adapt this bias under high contention, ensuring low tail latency (P95) without violating fairness guarantees (Jain's Index > 0.96).
+
+1. Core Principle: Bounded Bias
+--------------------------------
+
+SCHED_TEK preferentially lowers the **vruntime** of interactive, latency-sensitive tasks based on their interactivity score (**B_i**). The degree of preference is controlled by the global **alpha (α)** coefficient.
+
+The vruntime update for a task is modified as:
+
+    vruntime = vruntime + Δt * (1 + α * B_i)
+
+This bias is "bounded" by the **Hybrid Controller**, which continuously monitors system-wide fairness and starvation metrics and auto-dampens α and β when necessary.
+
+2. Tunable Parameters (/proc/sys/sched_tek/)
+-----------------------------------------------
+
+The scheduler exposes several knobs for advanced tuning and experimental validation.
+
+:bias_alpha:
+    Type: Integer (0-350, scaled by 1000 for 0.00-0.35)
+    Default: 200 (0.20)
+    Description: The primary bias coefficient (α) controlling vruntime skew. Higher values increase responsiveness but may reduce fairness under high load.
+
+:bias_beta:
+    Type: Integer (0-300, scaled by 1000 for 0.00-0.30)
+    Default: 150 (0.15)
+    Description: The runqueue selection amplification factor (β), used to provide a strong tie-breaker preference for biased tasks during pick_next_task.
+
+:bias_mode:
+    Type: Integer (0-2)
+    Default: 2 (Hybrid)
+    Description:
+    - 0: Static (Bias remains fixed by alpha/beta values)
+    - 1: Adaptive (Simple adaptive logic)
+    - 2: Hybrid (Full logic: Adaptation + Fairness/Starvation Dampening)
+
+:starvation_threshold:
+    Type: Integer (%)
+    Default: 2
+    Description: The maximum allowed starvation rate (in percent). If exceeded, the Hybrid Controller aggressively reduces bias (α, β) until the rate subsides.
+
+// --- B. Documentation/scheduler/Makefile modification (Pseudo-code) ---
+
+# Append SCHED_TEK documentation to the build list
+obj-$(CONFIG_SCHED_TEK) += sched-tek.rst
